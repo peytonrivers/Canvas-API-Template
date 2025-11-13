@@ -1,10 +1,12 @@
-# Template for anyone to grab the necessary information from Canvas API
+# Template for FastAPI Canvas LMS integration
 from fastapi import FastAPI
 import requests
+from bs4 import BeautifulSoup
+import html
 
 app = FastAPI()
 
-token = "Input Your Token Here"
+token = "Input_Your_Token_Here"
 url = "https://instructure.charlotte.edu/api/v1/courses"
 header = {"Authorization": f"Bearer {token}"}
 
@@ -164,24 +166,124 @@ def get_assignments():
         l += 1
     return {"assignments": final}
 
-# Get syllabus doesn't work
+# Get syllabus doesn't work since teachers block access
+from bs4 import BeautifulSoup
+import html
+
 @app.get("/syllabus")
 def get_syllabus():
     courses_data = get_courses()
-    course_id = courses_data['course_id']
+    course_ids = courses_data["course_id"]
+
+    syllabi = []
+
+    for c_id in course_ids:
+        params = {"include[]": "syllabus_body"}
+        new_url = f"{url}/{c_id}"
+        response = requests.get(new_url, headers=header, params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+
+            # RAW syllabus HTML (escaped)
+            raw_html = data.get("syllabus_body") or ""
+
+            # 1️⃣ Unescape \u003C → < 
+            unescaped = html.unescape(raw_html)
+
+            # 2️⃣ Convert HTML → clean readable text
+            soup = BeautifulSoup(unescaped, "html.parser")
+            clean_text = soup.get_text(separator=" ", strip=True)
+
+            syllabi.append({
+                "course_id": data.get("id"),
+                "name": data.get("name"),
+                "syllabus_text": clean_text
+            })
+
+    return {"syllabus": syllabi}
+
+
+@app.get("/modules")
+def get_modules():
+    course_id = get_courses()["course_id"]
     i = 0
-    courses = []
+    module_data = []
     while i < len(course_id):
-        new_url = f"{url}/{course_id[i]}"
+        new_url = f"{url}/{course_id[i]}/modules"
         response = requests.get(new_url, headers=header)
         data = response.json()
         if response.status_code == 200:
-            syllabus_info = {
-                "course_id": data.get("id"),
-                "name": data.get("name"),
-                "course_code": data.get("course_code"),
-                "syllabus_body": data.get("syllabus_body")
+            for module in data:
+                module_info = {
+                    "module_id": module.get("id"),
+                    "name": module.get("name"),
+                    "position": module.get("position"),
+                    "items_count": module.get("items_count"),
+                    "items_url": module.get("items_url")
                 }
-            courses.append(syllabus_info)
-        i+=1
-    return {"syllabus": courses}
+                module_data.append(module_info)
+        i += 1
+    return {"modules": module_data}
+
+@app.get("/modules_text")
+def get_modules_url():
+    course_id = get_courses()["course_id"]
+    i = 0
+    module_data = []
+    while i < len(course_id):
+        new_url = f"{url}/{course_id[i]}/modules"
+        response = requests.get(new_url, headers=header)
+        data = response.json()
+        if response.status_code == 200:
+            for module in data:
+                module_info = {
+                    "items_url": module.get("items_url")
+                }
+                module_data.append(module_info)
+        i += 1
+    return {"modules": module_data}
+
+@app.get("/modules_words")
+def get_modules_words():
+    # 1. Get all the module items_url values
+    modules = get_modules_url()["modules"]
+
+    all_pages_text = []
+
+    for module in modules:
+        items_url = module["items_url"]
+
+        # 2. Call the items_url (Canvas API – returns JSON list of items)
+        items_response = requests.get(items_url, headers=header)
+        if items_response.status_code != 200:
+            continue
+
+        items = items_response.json()
+
+        # 3. Loop through items in this module
+        for item in items:
+            # We care mostly about Canvas "Page" items for text
+            if item.get("type") == "Page":
+                page_api_url = item.get("url")  # this is an API URL for the page
+
+                # 4. Call the page API to get page HTML
+                page_resp = requests.get(page_api_url, headers=header)
+                if page_resp.status_code != 200:
+                    continue
+
+                page_data = page_resp.json()
+                html_body = page_data.get("body", "")  # HTML string
+
+                # 5. Use BeautifulSoup to strip HTML and get plain text
+                soup = BeautifulSoup(html_body, "html.parser")
+                text = soup.get_text(separator=" ", strip=True)
+
+                all_pages_text.append({
+                    "module_id": item.get("module_id"),
+                    "item_id": item.get("id"),
+                    "title": item.get("title"),
+                    "text": text
+                })
+
+    return {"pages": all_pages_text}
